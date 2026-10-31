@@ -1,3 +1,5 @@
+import ast
+import sys
 from pathlib import Path
 
 import cv2
@@ -6,7 +8,7 @@ import onnxruntime as ort
 
 root = Path(r"D:\Project\OpticalSelectionMachine\OnnxDeployLab")
 model_path = root / "models" / "cls" / "hezhuang5.onnx"
-image_path = root / "data" / "cls_test.jpg"
+image_path = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "data" / "cls_test.jpg"
 
 image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
 if image is None:
@@ -20,6 +22,23 @@ chw = float_image.transpose(2, 0, 1)
 input_data = np.ascontiguousarray(chw[None, ...])
 
 session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+
+metadata = session.get_modelmeta().custom_metadata_map
+print("Model metadata:")
+for key, value in metadata.items():
+    print(f"{key}: {value}")
+
+names = ast.literal_eval(metadata["names"])
+if not isinstance(names, dict) or set(names) != set(range(28)):
+    raise ValueError("Expected class IDs 0 through 27")
+labels = [names[i] for i in range(28)]
+if any(not isinstance(label, str) or not label.strip()
+       or "\n" in label or "\r" in label for label in labels):
+    raise ValueError("Expected non-empty single-line labels")
+label_path = model_path.parent / "labels.txt"
+label_path.write_text("\n".join(labels) + "\n", encoding="utf-8")
+print("Labels saved:", label_path)
+
 input_name = session.get_inputs()[0].name
 output_name = session.get_outputs()[0].name
 output = session.run([output_name], {input_name: input_data})[0]
@@ -35,3 +54,4 @@ for class_id, score in enumerate(scores):
     print(f"Class {class_id}: {score:.9g}")
 print("Best class ID:", best_id)
 print("Best score:", float(scores[best_id]))
+print("Best label:", labels[best_id])

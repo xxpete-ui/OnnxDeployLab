@@ -1,154 +1,116 @@
+#include "Classification.h"
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <cstdint>
-#include <filesystem>
+#include <opencv2/imgcodecs.hpp>
 
-#include <onnxruntime_cxx_api.h>
-#include <opencv2/opencv.hpp>
-
-std::vector<float> preprocessClassification(const cv::Mat& image)
+std::vector<std::string> loadLabels(const std::filesystem::path& labelPath)
 {
-    if (image.empty() || image.rows != 224 || image.cols != 224 ||
-        image.type() != CV_8UC3)
+    std::ifstream file(labelPath);
+    if (!file.is_open())
+        throw std::runtime_error("Failed to open labels file");
+
+    std::vector<std::string> labels;
+    std::string line;
+    while (std::getline(file, line))
     {
-        throw std::invalid_argument("Expected a 224x224 CV_8UC3 image");
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) throw std::runtime_error("Empty label found");
+        labels.push_back(line);
     }
-
-    cv::Mat rgbImage;
-    cv::cvtColor(image, rgbImage, cv::COLOR_BGR2RGB);
-    cv::Mat floatImage;
-    rgbImage.convertTo(floatImage, CV_32F, 1.0 / 255.0);
-
-    const int height = floatImage.rows;
-    const int width = floatImage.cols;
-    std::vector<float> data(static_cast<std::size_t>(3) * height * width);
-
-    for (int c = 0; c < 3; ++c)
-    {
-        for (int y = 0; y < height; ++y)
-        {
-            const cv::Vec3f* row = floatImage.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < width; ++x)
-            {
-                const std::size_t index =
-                    static_cast<std::size_t>(c) * height * width +
-                    static_cast<std::size_t>(y) * width + x;
-                data[index] = row[x][c];
-            }
-        }
-    }
-    return data;
+    if (file.bad()) throw std::runtime_error("Failed to read labels file");
+    return labels;
 }
 
 int main(int argc, char* argv[])
 {
     try
     {
+        // Preserve the optional model/image arguments from the previous checkpoint.
         if (argc != 1 && argc != 3)
         {
-            std::cerr << "Usage: model_inspect <model.onnx> <image>\n";
+            std::cerr << "Usage: model_inspect [<model.onnx> <224x224 image>]\n";
             return 1;
         }
+
+        std::cout << "ONNX Runtime version: "
+                  << OrtGetApiBase()->GetVersionString() << '\n';
+        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "OnnxDeployLab");
+        Ort::SessionOptions options;
         const std::filesystem::path modelPath = argc == 3
             ? std::filesystem::path(argv[1])
             : std::filesystem::path(
                 L"D:/Project/OpticalSelectionMachine/OnnxDeployLab/models/cls/hezhuang5.onnx");
-        const std::string imagePath = argc == 3 ? argv[2]
-            : "D:/Project/OpticalSelectionMachine/OnnxDeployLab/data/cls_test.jpg";
 
-        std::cout << "ONNX Runtime version: "
-                  << OrtGetApiBase()->GetVersionString() << '\n';
-
-        // Env is declared first so it outlives Session.
-        Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "OnnxDeployLab");
-        Ort::SessionOptions options;
+        const auto loadStart = std::chrono::steady_clock::now();
         Ort::Session session(env, modelPath.c_str(), options);
+        const auto loadEnd = std::chrono::steady_clock::now();
+        std::cout << "Model load time: "
+                  << std::chrono::duration<double, std::milli>(
+                         loadEnd - loadStart).count() << " ms\n";
 
+        const auto inputCount = session.GetInputCount();
+        const auto outputCount = session.GetOutputCount();
         std::cout << "Model loaded successfully!\n"
-                  << "Input count: " << session.GetInputCount() << '\n'
-                  << "Output count: " << session.GetOutputCount() << '\n';
-        if (session.GetInputCount() != 1 || session.GetOutputCount() != 1)
-        {
+                  << "Input count: " << inputCount << '\n'
+                  << "Output count: " << outputCount << '\n';
+        if (inputCount != 1 || outputCount != 1)
             throw std::runtime_error("Expected one input and one output");
-        }
 
         Ort::AllocatorWithDefaultOptions allocator;
         auto inputName = session.GetInputNameAllocated(0, allocator);
-        auto outputName = session.GetOutputNameAllocated(0, allocator);
         auto inputTypeInfo = session.GetInputTypeInfo(0);
         auto inputTensorInfo = inputTypeInfo.GetTensorTypeAndShapeInfo();
-        auto outputTypeInfo = session.GetOutputTypeInfo(0);
-        auto outputTensorInfo = outputTypeInfo.GetTensorTypeAndShapeInfo();
-
         std::cout << "Input name: " << inputName.get() << "\nInput shape: ";
         for (auto dim : inputTensorInfo.GetShape()) std::cout << dim << ' ';
-        std::cout << "\nOutput name: " << outputName.get() << "\nOutput shape: ";
-        for (auto dim : outputTensorInfo.GetShape()) std::cout << dim << ' ';
         std::cout << '\n';
         if (inputTensorInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-        {
             throw std::runtime_error("Expected float32 input");
-        }
 
-        cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
-        if (image.empty()) throw std::runtime_error("Failed to read image: " + imagePath);
-        std::cout << "Image width: " << image.cols << '\n'
-                  << "Image height: " << image.rows << '\n'
-                  << "Image channels: " << image.channels() << '\n';
-
-        std::vector<int64_t> runShape = {1, 3, 224, 224};
-        auto inputData = preprocessClassification(image);
-        std::cout << "Input elements: " << inputData.size() << '\n'
-                  << "Input bytes: " << inputData.size() * sizeof(float) << '\n';
-
-        auto memoryInfo = Ort::MemoryInfo::CreateCpu(
-            OrtArenaAllocator, OrtMemTypeDefault);
-        // Tensor borrows inputData; keep the vector alive and unchanged during Run.
-        auto inputTensor = Ort::Value::CreateTensor<float>(
-            memoryInfo, inputData.data(), inputData.size(),
-            runShape.data(), runShape.size());
-        std::cout << "Input tensor created\n";
-
-        const char* inputNames[] = {inputName.get()};
-        const char* outputNames[] = {outputName.get()};
-        auto outputs = session.Run(
-            Ort::RunOptions{nullptr}, inputNames, &inputTensor, 1,
-            outputNames, 1);
-        std::cout << "Inference finished\n";
-
-        auto resultInfo = outputs[0].GetTensorTypeAndShapeInfo();
-        const auto resultShape = resultInfo.GetShape();
-        std::cout << "Actual output shape: ";
-        for (auto dim : resultShape) std::cout << dim << ' ';
+        auto outputName = session.GetOutputNameAllocated(0, allocator);
+        auto outputTypeInfo = session.GetOutputTypeInfo(0);
+        auto outputTensorInfo = outputTypeInfo.GetTensorTypeAndShapeInfo();
+        std::cout << "Output name: " << outputName.get() << "\nOutput shape: ";
+        for (auto dim : outputTensorInfo.GetShape()) std::cout << dim << ' ';
         std::cout << '\n';
 
-        if (resultInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-            resultShape != std::vector<int64_t>{1, 28})
-        {
-            throw std::runtime_error("Expected float32 output with shape [1,28]");
-        }
+        const auto labels = loadLabels(modelPath.parent_path() / "labels.txt");
+        if (labels.size() != 28) throw std::runtime_error("Expected 28 labels");
+        std::cout << "Label count: " << labels.size() << '\n';
 
-        // scores borrows data owned by outputs[0].
-        const float* scores = outputs[0].GetTensorData<float>();
-        const std::size_t scoreCount = resultInfo.GetElementCount();
-        std::cout << "Output elements: " << scoreCount << '\n';
-        for (std::size_t i = 0; i < scoreCount; ++i)
-            std::cout << "Class " << i << ": " << scores[i] << '\n';
+        const std::vector<std::string> imagePaths = argc == 3
+            ? std::vector<std::string>{argv[2]}
+            : std::vector<std::string>{
+                "D:/Project/OpticalSelectionMachine/OnnxDeployLab/data/cls_test.jpg",
+                "D:/Project/OpticalSelectionMachine/OnnxDeployLab/data/cls_test2.jpg"};
 
-        std::size_t bestClassId = 0;
-        float bestScore = scores[0];
-        for (std::size_t i = 1; i < scoreCount; ++i)
+        for (const auto& imagePath : imagePaths)
         {
-            if (scores[i] > bestScore)
-            {
-                bestScore = scores[i];
-                bestClassId = i;
-            }
+            cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
+            if (image.empty())
+                throw std::runtime_error("Failed to read image: " + imagePath);
+
+            ClassificationTiming timing;
+            const auto start = std::chrono::steady_clock::now();
+            ClassificationResult result = classify(session, image, timing);
+            const auto end = std::chrono::steady_clock::now();
+            const double elapsedMs =
+                std::chrono::duration<double, std::milli>(end - start).count();
+
+            std::cout << "Image: "
+                      << std::filesystem::path(imagePath).filename().string() << '\n'
+                      << "Best class ID: " << result.classId << '\n'
+                      << "Best label: " << labels.at(result.classId) << '\n'
+                      << "Best score: " << result.score << '\n'
+                      << "Preprocess: " << timing.preprocessMs << " ms\n"
+                      << "Run: " << timing.runMs << " ms\n"
+                      << "Classification: " << elapsedMs << " ms\n\n";
         }
-        std::cout << "Best class ID: " << bestClassId << '\n'
-                  << "Best score: " << bestScore << '\n';
     }
     catch (const Ort::Exception& e)
     {
